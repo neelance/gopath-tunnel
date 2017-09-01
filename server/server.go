@@ -6,7 +6,6 @@ import (
 	"context"
 	"encoding/gob"
 	"errors"
-	"fmt"
 	"go/build"
 	"io"
 	"log"
@@ -143,7 +142,6 @@ func (s *Server) Fetch(ctx context.Context, importPath string, includeTests bool
 			if !ok || !bytes.Equal(cachedSrc.Hash, src.Hash) {
 				return nil, errors.New("cache error")
 			}
-			fmt.Println("from cache")
 			src.Files = cachedSrc.Files
 			continue
 		}
