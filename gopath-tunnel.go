@@ -67,12 +67,18 @@ func connect(url string) error {
 			resp = gotool.ImportPaths([]string{"all"})
 
 		case protocol.ActionFetch:
-			context := build.Default
-			context.GOARCH = req.GOARCH
-			context.GOOS = req.GOOS
+			context := &build.Context{
+				GOROOT:      build.Default.GOROOT,
+				GOPATH:      build.Default.GOPATH,
+				GOARCH:      req.GOARCH,
+				GOOS:        req.GOOS,
+				BuildTags:   req.BuildTags,
+				ReleaseTags: req.ReleaseTags,
+				Compiler:    "gc",
+			}
 
 			srcs := make(protocol.Srcs)
-			scanPackage(&context, req.SrcID, req.Cached, srcs)
+			scanPackage(context, req.SrcID, req.Cached, srcs)
 			resp = srcs
 
 		default:

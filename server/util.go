@@ -21,9 +21,10 @@ func FileSystemForSources(srcs protocol.Srcs) vfs.FileSystem {
 
 func BuildContextForFileSystem(fs vfs.FileSystem) *build.Context {
 	return &build.Context{
-		GOROOT:   "/",
-		Compiler: "gc",
-		JoinPath: path.Join,
+		GOROOT:      "/",
+		Compiler:    "gc",
+		ReleaseTags: build.Default.ReleaseTags,
+		JoinPath:    path.Join,
 		SplitPathList: func(list string) []string {
 			return []string{list}
 		},

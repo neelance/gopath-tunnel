@@ -10,12 +10,14 @@ const (
 )
 
 type Request struct {
-	Action Action
-	Error  string
-	SrcID  SrcID
-	Cached map[SrcID][]byte
-	GOARCH string
-	GOOS   string
+	Action      Action
+	Error       string
+	SrcID       SrcID
+	Cached      map[SrcID][]byte
+	GOARCH      string
+	GOOS        string
+	BuildTags   []string
+	ReleaseTags []string
 }
 
 type SrcID struct {
