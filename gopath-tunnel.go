@@ -145,6 +145,9 @@ func scanPackage(context *build.Context, srcID protocol.SrcID, cached map[protoc
 			scanPackage(context, protocol.SrcID{ImportPath: imp, IncludeTests: false}, cached, srcs)
 		}
 		for _, imp := range pkg.XTestImports {
+			if imp == srcID.ImportPath {
+				continue
+			}
 			scanPackage(context, protocol.SrcID{ImportPath: imp, IncludeTests: false}, cached, srcs)
 		}
 	}
