@@ -1,10 +1,13 @@
 package server
 
 import (
+	"bytes"
 	"go/build"
 	"io"
+	"io/ioutil"
 	"os"
 	"path"
+	"path/filepath"
 
 	"github.com/neelance/gopath-tunnel/protocol"
 	"golang.org/x/tools/godoc/vfs"
@@ -17,6 +20,46 @@ func FileSystemForSources(srcs protocol.Srcs) vfs.FileSystem {
 		fs.Bind("/src/"+id.ImportPath, mapfs.New(src.Files), "/", vfs.BindReplace)
 	}
 	return fs
+}
+
+func SyncSourcesToDisk(srcs protocol.Srcs, srcDir string) error {
+	for id, src := range srcs {
+		dir := filepath.Join(srcDir, id.ImportPath)
+		if err := os.MkdirAll(dir, 0777); err != nil && err != os.ErrExist {
+			return err
+		}
+
+		fis, err := ioutil.ReadDir(dir)
+		if err != nil {
+			return err
+		}
+		for _, fi := range fis {
+			if fi.IsDir() {
+				continue
+			}
+			if _, ok := src.Files[fi.Name()]; !ok {
+				if err := os.Remove(filepath.Join(dir, fi.Name())); err != nil {
+					return err
+				}
+			}
+		}
+
+		for basename, contents := range src.Files {
+			filename := filepath.Join(dir, basename)
+			byteContents := []byte(contents)
+
+			if currentContents, err := ioutil.ReadFile(filename); err == nil {
+				if bytes.Equal(currentContents, byteContents) {
+					continue // don't modify file
+				}
+			}
+
+			if err := ioutil.WriteFile(filename, byteContents, 0666); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func BuildContextForFileSystem(fs vfs.FileSystem) *build.Context {
@@ -41,44 +84,4 @@ func BuildContextForFileSystem(fs vfs.FileSystem) *build.Context {
 			return fs.Open(path)
 		},
 	}
-}
-
-func WriteFileSystemToDisk(dstDir string, fs vfs.FileSystem, srcDir string) error {
-	fis, err := fs.ReadDir(srcDir)
-	if err != nil {
-		return err
-	}
-
-	if err := os.Mkdir(dstDir, 0777); err != nil {
-		return err
-	}
-
-	for _, fi := range fis {
-		dstName := path.Join(dstDir, fi.Name())
-		srcName := path.Join(srcDir, fi.Name())
-
-		if fi.IsDir() {
-			if err := WriteFileSystemToDisk(dstName, fs, srcName); err != nil {
-				return err
-			}
-			continue
-		}
-
-		srcF, err := fs.Open(srcName)
-		if err != nil {
-			return err
-		}
-
-		dstF, err := os.Create(dstName)
-		if err != nil {
-			return err
-		}
-
-		io.Copy(dstF, srcF)
-
-		srcF.Close()
-		dstF.Close()
-	}
-
-	return nil
 }
