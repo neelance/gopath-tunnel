@@ -140,6 +140,7 @@ func scanPackage(context *build.Context, srcID protocol.SrcID, cached map[protoc
 	}
 	if !bytes.Equal(src.Hash, cached[srcID]) { // only add files if not in cache
 		src.Files = files
+		fmt.Printf("Uploading: %s\n", srcID.ImportPath)
 	}
 	srcs[srcID] = src
 
