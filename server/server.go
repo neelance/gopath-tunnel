@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"time"
 
 	"golang.org/x/net/websocket"
 
@@ -36,6 +37,21 @@ func New() *Server {
 
 func (s *Server) Handler() http.Handler {
 	return websocket.Server{Handler: func(ws *websocket.Conn) {
+		go func() {
+			pingCodec := websocket.Codec{
+				Marshal: func(v interface{}) (data []byte, payloadType byte, err error) {
+					return nil, websocket.PingFrame, nil
+				},
+			}
+
+			for {
+				time.Sleep(30 * time.Second)
+				if err := pingCodec.Send(ws, nil); err != nil {
+					break
+				}
+			}
+		}()
+
 		s.HandleStreams(ws, ws)
 	}}
 }
