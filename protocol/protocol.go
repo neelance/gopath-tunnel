@@ -20,6 +20,11 @@ type Request struct {
 	ReleaseTags []string
 }
 
+type FetchResponse struct {
+	Srcs  Srcs
+	Error string
+}
+
 type SrcID struct {
 	ImportPath   string
 	IncludeTests bool

@@ -57,7 +57,7 @@ func connect(url string) error {
 		var resp interface{}
 		switch req.Action {
 		case protocol.ActionVersion:
-			resp = 1
+			resp = 2
 
 		case protocol.ActionError:
 			fmt.Println(req.Error)
@@ -78,8 +78,11 @@ func connect(url string) error {
 			}
 
 			srcs := make(protocol.Srcs)
-			scanPackage(context, req.SrcID, req.Cached, srcs)
-			resp = srcs
+			if err := scanPackage(context, req.SrcID, req.Cached, srcs); err != nil {
+				resp = &protocol.FetchResponse{Error: err.Error()}
+				break
+			}
+			resp = &protocol.FetchResponse{Srcs: srcs}
 
 		default:
 			return fmt.Errorf("protocol error")
@@ -92,21 +95,21 @@ func connect(url string) error {
 	}
 }
 
-func scanPackage(context *build.Context, srcID protocol.SrcID, cached map[protocol.SrcID][]byte, srcs protocol.Srcs) {
+func scanPackage(context *build.Context, srcID protocol.SrcID, cached map[protocol.SrcID][]byte, srcs protocol.Srcs) error {
 	if srcID.ImportPath == "C" {
-		return
+		return nil
 	}
 	if _, ok := srcs[srcID]; ok {
-		return
+		return nil
 	}
 
 	pkg, err := context.Import(srcID.ImportPath, "", 0)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 
 	if pkg.Goroot {
-		return
+		return nil
 	}
 
 	files := make(map[string]string)
@@ -145,19 +148,27 @@ func scanPackage(context *build.Context, srcID protocol.SrcID, cached map[protoc
 	srcs[srcID] = src
 
 	for _, imp := range pkg.Imports {
-		scanPackage(context, protocol.SrcID{ImportPath: imp, IncludeTests: false}, cached, srcs)
+		if err := scanPackage(context, protocol.SrcID{ImportPath: imp, IncludeTests: false}, cached, srcs); err != nil {
+			return err
+		}
 	}
 	if srcID.IncludeTests {
 		for _, imp := range pkg.TestImports {
-			scanPackage(context, protocol.SrcID{ImportPath: imp, IncludeTests: false}, cached, srcs)
+			if err := scanPackage(context, protocol.SrcID{ImportPath: imp, IncludeTests: false}, cached, srcs); err != nil {
+				return err
+			}
 		}
 		for _, imp := range pkg.XTestImports {
 			if imp == srcID.ImportPath {
 				continue
 			}
-			scanPackage(context, protocol.SrcID{ImportPath: imp, IncludeTests: false}, cached, srcs)
+			if err := scanPackage(context, protocol.SrcID{ImportPath: imp, IncludeTests: false}, cached, srcs); err != nil {
+				return err
+			}
 		}
 	}
+
+	return nil
 }
 
 func calculateHash(files map[string]string) []byte {

@@ -73,8 +73,11 @@ func (s *Server) HandleStreams(w io.Writer, r io.Reader) {
 		return
 	}
 
-	if version != 1 {
-		if err := enc.Encode(&protocol.Request{Action: protocol.ActionError, Error: "wrong version"}); err != nil {
+	if version != 2 {
+		if err := enc.Encode(&protocol.Request{
+			Action: protocol.ActionError,
+			Error:  "Incompatible client version. Please upgrade gopath-tunnel: go get -u github.com/neelance/gopath-tunnel",
+		}); err != nil {
 			log.Print(err)
 			return
 		}
@@ -128,7 +131,7 @@ func (s *Server) Fetch(ctx context.Context, importPath string, includeTests bool
 		cached[id] = src.Hash
 	}
 
-	var srcs protocol.Srcs
+	var resp protocol.FetchResponse
 	done := make(chan struct{})
 	s.reqs <- &reqResp{
 		req: &protocol.Request{
@@ -142,7 +145,7 @@ func (s *Server) Fetch(ctx context.Context, importPath string, includeTests bool
 			GOOS:        build.Default.GOOS,
 			ReleaseTags: build.Default.ReleaseTags,
 		},
-		resp: &srcs,
+		resp: &resp,
 		done: done,
 	}
 
@@ -153,7 +156,11 @@ func (s *Server) Fetch(ctx context.Context, importPath string, includeTests bool
 		return nil, ctx.Err()
 	}
 
-	for id, src := range srcs {
+	if resp.Error != "" {
+		return nil, errors.New(resp.Error)
+	}
+
+	for id, src := range resp.Srcs {
 		if src.Files == nil {
 			cachedSrc, ok := s.cache[id]
 			if !ok || !bytes.Equal(cachedSrc.Hash, src.Hash) {
@@ -165,5 +172,5 @@ func (s *Server) Fetch(ctx context.Context, importPath string, includeTests bool
 		s.cache[id] = src
 	}
 
-	return srcs, nil
+	return resp.Srcs, nil
 }
