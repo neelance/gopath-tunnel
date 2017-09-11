@@ -57,7 +57,7 @@ func connect(url string) error {
 		var resp interface{}
 		switch req.Action {
 		case protocol.ActionVersion:
-			resp = 2
+			resp = 3
 
 		case protocol.ActionError:
 			fmt.Println(req.Error)
@@ -96,9 +96,6 @@ func connect(url string) error {
 }
 
 func scanPackage(context *build.Context, srcID protocol.SrcID, cached map[protocol.SrcID][]byte, srcs protocol.Srcs) error {
-	if srcID.ImportPath == "C" {
-		return nil
-	}
 	if _, ok := srcs[srcID]; ok {
 		return nil
 	}
@@ -147,24 +144,23 @@ func scanPackage(context *build.Context, srcID protocol.SrcID, cached map[protoc
 	}
 	srcs[srcID] = src
 
-	for _, imp := range pkg.Imports {
-		if err := scanPackage(context, protocol.SrcID{ImportPath: imp, IncludeTests: false}, cached, srcs); err != nil {
+	imports := pkg.Imports
+	if srcID.IncludeTests {
+		imports = append(imports, pkg.TestImports...)
+		imports = append(imports, pkg.XTestImports...)
+	}
+	for _, imp := range imports {
+		if imp == "C" || imp == srcID.ImportPath {
+			continue
+		}
+
+		impPkg, err := context.Import(imp, pkg.Dir, build.FindOnly)
+		if err != nil {
 			return err
 		}
-	}
-	if srcID.IncludeTests {
-		for _, imp := range pkg.TestImports {
-			if err := scanPackage(context, protocol.SrcID{ImportPath: imp, IncludeTests: false}, cached, srcs); err != nil {
-				return err
-			}
-		}
-		for _, imp := range pkg.XTestImports {
-			if imp == srcID.ImportPath {
-				continue
-			}
-			if err := scanPackage(context, protocol.SrcID{ImportPath: imp, IncludeTests: false}, cached, srcs); err != nil {
-				return err
-			}
+
+		if err := scanPackage(context, protocol.SrcID{ImportPath: impPkg.ImportPath, IncludeTests: false}, cached, srcs); err != nil {
+			return err
 		}
 	}
 

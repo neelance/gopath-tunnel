@@ -73,7 +73,7 @@ func (s *Server) HandleStreams(w io.Writer, r io.Reader) {
 		return
 	}
 
-	if version != 2 {
+	if version != 3 {
 		if err := enc.Encode(&protocol.Request{
 			Action: protocol.ActionError,
 			Error:  "Incompatible client version. Please upgrade gopath-tunnel: go get -u github.com/neelance/gopath-tunnel",
