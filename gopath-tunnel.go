@@ -134,6 +134,12 @@ func scanPackage(context *build.Context, srcID protocol.SrcID, cached map[protoc
 		addFiles(pkg.TestGoFiles)
 		addFiles(pkg.XTestGoFiles)
 	}
+	filepath.Walk(filepath.Join(pkg.Dir, "testdata"), func(path string, info os.FileInfo, err error) error {
+		if err == nil && !info.IsDir() {
+			addFiles([]string{path[len(pkg.Dir)+1:]})
+		}
+		return nil
+	})
 
 	src := &protocol.Src{
 		Hash: calculateHash(files),

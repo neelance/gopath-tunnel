@@ -17,49 +17,101 @@ import (
 func FileSystemForSources(srcs protocol.Srcs) vfs.FileSystem {
 	fs := vfs.NewNameSpace()
 	for id, src := range srcs {
-		fs.Bind("/src/"+id.ImportPath, mapfs.New(src.Files), "/", vfs.BindReplace)
+		fs.Bind(id.ImportPath, mapfs.New(src.Files), "/", vfs.BindReplace)
 	}
 	return fs
 }
 
-func SyncSourcesToDisk(srcs protocol.Srcs, srcDir string) error {
-	for id, src := range srcs {
-		dir := filepath.Join(srcDir, id.ImportPath)
-		if err := os.MkdirAll(dir, 0777); err != nil && err != os.ErrExist {
-			return err
+func SyncFileSystemToDisk(fs vfs.FileSystem, rootDir string) error {
+	// add new files
+	if err := walk(fs, "", func(fi os.FileInfo) error {
+		fullName := filepath.Join(rootDir, fi.Name())
+		if fi.IsDir() {
+			err := os.Mkdir(fullName, 0777)
+			if err != nil && !os.IsExist(err) {
+				return err
+			}
+			return nil
 		}
 
-		fis, err := ioutil.ReadDir(dir)
+		newContents, err := readFile(fs, fi.Name())
 		if err != nil {
 			return err
 		}
-		for _, fi := range fis {
-			if fi.IsDir() {
-				continue
-			}
-			if _, ok := src.Files[fi.Name()]; !ok {
-				if err := os.Remove(filepath.Join(dir, fi.Name())); err != nil {
-					return err
-				}
+
+		if currentContents, err := ioutil.ReadFile(fullName); err == nil {
+			if bytes.Equal(currentContents, newContents) {
+				return nil // don't modify file
 			}
 		}
 
-		for basename, contents := range src.Files {
-			filename := filepath.Join(dir, basename)
-			byteContents := []byte(contents)
+		if err := ioutil.WriteFile(fullName, newContents, 0666); err != nil {
+			return err
+		}
 
-			if currentContents, err := ioutil.ReadFile(filename); err == nil {
-				if bytes.Equal(currentContents, byteContents) {
-					continue // don't modify file
-				}
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	// clean up removed files
+	if err := walk(vfs.OS(rootDir), "", func(fi os.FileInfo) error {
+		fullName := filepath.Join(rootDir, fi.Name())
+		if fi.IsDir() {
+			if _, err := fs.ReadDir(fi.Name()); os.IsNotExist(err) {
+				return os.RemoveAll(fullName)
 			}
+			return nil
+		}
+		if _, err := fs.Lstat(fi.Name()); os.IsNotExist(err) {
+			return os.Remove(fullName)
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
 
-			if err := ioutil.WriteFile(filename, byteContents, 0666); err != nil {
+	return nil
+}
+
+func walk(fs vfs.FileSystem, dir string, visitor func(fi os.FileInfo) error) error {
+	fis, err := fs.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+
+	for _, fi := range fis {
+		fullName := path.Join(dir, fi.Name())
+		if err := visitor(&walkFileInfo{fi, fullName}); err != nil {
+			return err
+		}
+		if fi.IsDir() {
+			if err := walk(fs, fullName, visitor); err != nil {
 				return err
 			}
 		}
 	}
+
 	return nil
+}
+
+func readFile(fs vfs.FileSystem, name string) ([]byte, error) {
+	f, err := fs.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	return ioutil.ReadAll(f)
+}
+
+type walkFileInfo struct {
+	os.FileInfo
+	name string
+}
+
+func (fi *walkFileInfo) Name() string {
+	return fi.name
 }
 
 func BuildContextForFileSystem(fs vfs.FileSystem) *build.Context {
