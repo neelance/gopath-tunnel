@@ -12,9 +12,9 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
-	"github.com/kisielk/gotool"
 	"github.com/neelance/gopath-tunnel/protocol"
 	"golang.org/x/net/websocket"
 )
@@ -64,7 +64,47 @@ func connect(url string) error {
 			os.Exit(1)
 
 		case protocol.ActionList:
-			resp = gotool.ImportPaths([]string{"all"})
+			var packages []string
+			var scanDir func(root string, dir string)
+			scanDir = func(root string, dir string) {
+				fis, err := ioutil.ReadDir(filepath.Join(root, dir))
+				if err != nil {
+					return
+				}
+
+				hasGo := false
+				for _, fi := range fis {
+					name := fi.Name()
+					if !fi.IsDir() {
+						if strings.HasSuffix(name, ".go") {
+							hasGo = true
+						}
+						continue
+					}
+					if name[0] == '.' ||
+						name[0] == '_' ||
+						name == "testdata" ||
+						name == "node_modules" ||
+						(dir == "" && (name == "builtin" || name == "mod")) {
+						continue
+					}
+					scanDir(root, filepath.Join(dir, name))
+				}
+
+				if hasGo && dir != "" {
+					packages = append(packages, dir)
+				}
+			}
+
+			scanRoot := func(dir string) {
+				scanDir(filepath.Join(dir, "src"), "")
+			}
+			scanRoot(build.Default.GOROOT)
+			for _, gopath := range filepath.SplitList(build.Default.GOPATH) {
+				scanRoot(gopath)
+			}
+
+			resp = packages
 
 		case protocol.ActionFetch:
 			context := &build.Context{
