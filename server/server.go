@@ -1,127 +1,95 @@
 package server
 
 import (
-	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/gob"
 	"errors"
 	"go/build"
-	"io"
 	"log"
+	"net"
 	"net/http"
-	"time"
+	"sync"
 
+	"golang.org/x/net/http2"
 	"golang.org/x/net/websocket"
 
 	"github.com/neelance/gopath-tunnel/protocol"
 )
 
 type Server struct {
-	reqs  chan *reqResp
 	cache protocol.Srcs
+
+	mu sync.Mutex
+	cl *http.Client
 }
 
-type reqResp struct {
-	req  *protocol.Request
-	resp interface{}
-	done chan struct{}
+func (s *Server) client() *http.Client {
+	s.mu.Lock()
+	cl := s.cl
+	s.mu.Unlock()
+	return cl
 }
 
 func New() *Server {
 	return &Server{
-		reqs:  make(chan *reqResp, 100),
 		cache: make(protocol.Srcs),
 	}
 }
 
 func (s *Server) Handler() http.Handler {
-	return websocket.Server{Handler: func(ws *websocket.Conn) {
-		go func() {
-			pingCodec := websocket.Codec{
-				Marshal: func(v interface{}) (data []byte, payloadType byte, err error) {
-					return nil, websocket.PingFrame, nil
+	return websocket.Handler(func(ws *websocket.Conn) {
+		dialed := false
+		s.mu.Lock()
+		s.cl = &http.Client{
+			Transport: &withDummyScheme{&http2.Transport{
+				DialTLS: func(network, addr string, cfg *tls.Config) (net.Conn, error) {
+					if dialed {
+						panic("already dialed")
+					}
+					dialed = true
+					return ws, nil
 				},
-			}
+			}},
+		}
+		s.mu.Unlock()
 
-			for {
-				time.Sleep(30 * time.Second)
-				if err := pingCodec.Send(ws, nil); err != nil {
-					break
-				}
+		var version int
+		if err := post(s.client(), "/version", nil, &version); err != nil {
+			log.Print(err)
+			return
+		}
+		if version != 4 {
+			req := &protocol.ErrorRequest{
+				Error: "Incompatible client version. Please upgrade gopath-tunnel: go get -u github.com/neelance/gopath-tunnel",
 			}
-		}()
+			if err := post(s.client(), "/error", req, nil); err != nil {
+				log.Print(err)
+				return
+			}
+			ws.Close()
+			return
+		}
 
-		s.HandleStreams(ws, ws)
-	}}
+		<-ws.Request().Context().Done()
+	})
 }
 
-func (s *Server) HandleStreams(w io.Writer, r io.Reader) {
-	dec := gob.NewDecoder(r)
-	bw := bufio.NewWriter(w)
-	enc := gob.NewEncoder(bw)
+type withDummyScheme struct {
+	t http.RoundTripper
+}
 
-	if err := enc.Encode(&protocol.Request{Action: protocol.ActionVersion}); err != nil {
-		log.Print(err)
-		return
-	}
-	bw.Flush()
-
-	var version int
-	if err := dec.Decode(&version); err != nil {
-		log.Print(err)
-		return
-	}
-
-	if version != 3 {
-		if err := enc.Encode(&protocol.Request{
-			Action: protocol.ActionError,
-			Error:  "Incompatible client version. Please upgrade gopath-tunnel: go get -u github.com/neelance/gopath-tunnel",
-		}); err != nil {
-			log.Print(err)
-			return
-		}
-		bw.Flush()
-		return
-	}
-
-	for rr := range s.reqs {
-		if err := enc.Encode(rr.req); err != nil {
-			log.Print(err)
-			s.reqs <- rr
-			return
-		}
-		bw.Flush()
-
-		if err := dec.Decode(rr.resp); err != nil {
-			if err != io.EOF {
-				log.Print(err)
-			}
-			s.reqs <- rr
-			return
-		}
-		close(rr.done)
-	}
+func (t *withDummyScheme) RoundTrip(req *http.Request) (*http.Response, error) {
+	req.URL.Scheme = "https"
+	return t.t.RoundTrip(req)
 }
 
 func (s *Server) List(ctx context.Context) ([]string, error) {
 	var pkgs []string
-	done := make(chan struct{})
-	s.reqs <- &reqResp{
-		req: &protocol.Request{
-			Action: protocol.ActionList,
-		},
-		resp: &pkgs,
-		done: done,
+	if err := post(s.client(), "/packages", nil, &pkgs); err != nil {
+		return nil, err
 	}
-
-	select {
-	case <-done:
-		// ok
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
-
 	return pkgs, nil
 }
 
@@ -131,33 +99,19 @@ func (s *Server) Fetch(ctx context.Context, importPath string, includeTests bool
 		cached[id] = src.Hash
 	}
 
-	var resp protocol.FetchResponse
-	done := make(chan struct{})
-	s.reqs <- &reqResp{
-		req: &protocol.Request{
-			Action: protocol.ActionFetch,
-			SrcID: protocol.SrcID{
-				ImportPath:   importPath,
-				IncludeTests: includeTests,
-			},
-			Cached:      cached,
-			GOARCH:      build.Default.GOARCH,
-			GOOS:        build.Default.GOOS,
-			ReleaseTags: build.Default.ReleaseTags,
+	req := &protocol.FetchRequest{
+		SrcID: protocol.SrcID{
+			ImportPath:   importPath,
+			IncludeTests: includeTests,
 		},
-		resp: &resp,
-		done: done,
+		Cached:      cached,
+		GOARCH:      build.Default.GOARCH,
+		GOOS:        build.Default.GOOS,
+		ReleaseTags: build.Default.ReleaseTags,
 	}
-
-	select {
-	case <-done:
-		// ok
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
-
-	if resp.Error != "" {
-		return nil, errors.New(resp.Error)
+	var resp protocol.FetchResponse
+	if err := post(s.client(), "/fetch", req, &resp); err != nil {
+		return nil, err
 	}
 
 	for id, src := range resp.Srcs {
@@ -173,4 +127,27 @@ func (s *Server) Fetch(ctx context.Context, importPath string, includeTests bool
 	}
 
 	return resp.Srcs, nil
+}
+
+func post(c *http.Client, url string, reqData, respData interface{}) error {
+	var buf bytes.Buffer
+	if reqData != nil {
+		if err := gob.NewEncoder(&buf).Encode(reqData); err != nil {
+			return err
+		}
+	}
+
+	resp, err := c.Post(url, "application/json", &buf)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if respData != nil {
+		if err := gob.NewDecoder(resp.Body).Decode(respData); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"crypto/md5"
 	"encoding/gob"
@@ -9,6 +8,7 @@ import (
 	"go/build"
 	"io/ioutil"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/neelance/gopath-tunnel/protocol"
+	"golang.org/x/net/http2"
 	"golang.org/x/net/websocket"
 )
 
@@ -24,114 +25,114 @@ func main() {
 		fmt.Println("Usage: gopath-tunnel [url]")
 		os.Exit(1)
 	}
-
 	url := os.Args[1]
-	for {
-		err := connect(url)
-		fmt.Printf("Error: %s\n\n", err)
-		time.Sleep(2 * time.Second)
-	}
-}
 
-func connect(url string) error {
-	fmt.Printf("Connecting to %s...\n", url)
+	gotError := false
+	mux := http.NewServeMux()
 
-	ws, err := websocket.Dial(url, "", "http://localhost/")
-	if err != nil {
-		return err
-	}
-	defer ws.Close()
+	mux.Handle("/version", gobHandler(func(r *http.Request) (interface{}, error) {
+		return 4, nil
+	}))
 
-	fmt.Println("Connected.")
-
-	dec := gob.NewDecoder(ws)
-	bw := bufio.NewWriter(ws)
-	enc := gob.NewEncoder(bw)
-
-	for {
-		var req protocol.Request
-		if err := dec.Decode(&req); err != nil {
-			return err
+	mux.Handle("/error", gobHandler(func(r *http.Request) (interface{}, error) {
+		var req *protocol.ErrorRequest
+		if err := gob.NewDecoder(r.Body).Decode(&req); err != nil {
+			return nil, err
 		}
 
-		var resp interface{}
-		switch req.Action {
-		case protocol.ActionVersion:
-			resp = 3
+		fmt.Fprintln(os.Stderr, req.Error)
+		gotError = true
 
-		case protocol.ActionError:
-			fmt.Println(req.Error)
+		return true, nil
+	}))
+
+	mux.Handle("/packages", gobHandler(func(r *http.Request) (interface{}, error) {
+		packages := []string{}
+		var scanDir func(root string, dir string)
+		scanDir = func(root string, dir string) {
+			fis, err := ioutil.ReadDir(filepath.Join(root, dir))
+			if err != nil {
+				return
+			}
+
+			hasGo := false
+			for _, fi := range fis {
+				name := fi.Name()
+				if !fi.IsDir() {
+					if strings.HasSuffix(name, ".go") {
+						hasGo = true
+					}
+					continue
+				}
+				if name[0] == '.' ||
+					name[0] == '_' ||
+					name == "testdata" ||
+					name == "node_modules" ||
+					(dir == "" && (name == "builtin" || name == "mod")) {
+					continue
+				}
+				scanDir(root, filepath.Join(dir, name))
+			}
+
+			if hasGo && dir != "" {
+				packages = append(packages, dir)
+			}
+		}
+
+		scanRoot := func(dir string) {
+			scanDir(filepath.Join(dir, "src"), "")
+		}
+		scanRoot(build.Default.GOROOT)
+		for _, gopath := range filepath.SplitList(build.Default.GOPATH) {
+			scanRoot(gopath)
+		}
+
+		return packages, nil
+	}))
+
+	mux.Handle("/fetch", gobHandler(func(r *http.Request) (interface{}, error) {
+		var req protocol.FetchRequest
+		if err := gob.NewDecoder(r.Body).Decode(&req); err != nil {
+			return nil, err
+		}
+
+		context := &build.Context{
+			GOROOT:      build.Default.GOROOT,
+			GOPATH:      build.Default.GOPATH,
+			GOARCH:      req.GOARCH,
+			GOOS:        req.GOOS,
+			BuildTags:   req.BuildTags,
+			ReleaseTags: req.ReleaseTags,
+			Compiler:    "gc",
+		}
+
+		srcs := make(protocol.Srcs)
+		if err := scanPackage(context, req.SrcID, req.Cached, srcs); err != nil {
+			return &protocol.FetchResponse{Error: err.Error()}, nil
+		}
+		return &protocol.FetchResponse{Srcs: srcs}, nil
+	}))
+
+	for {
+		fmt.Printf("Connecting to %s...\n", url)
+
+		ws, err := websocket.Dial(url, "", "http://localhost/")
+		if err != nil {
+			fmt.Printf("Error: %s\n\n", err)
+			time.Sleep(2 * time.Second)
+			continue
+		}
+
+		fmt.Println("Connected.")
+
+		s := &http2.Server{}
+		s.ServeConn(ws, &http2.ServeConnOpts{Handler: mux})
+		if gotError {
 			os.Exit(1)
-
-		case protocol.ActionList:
-			var packages []string
-			var scanDir func(root string, dir string)
-			scanDir = func(root string, dir string) {
-				fis, err := ioutil.ReadDir(filepath.Join(root, dir))
-				if err != nil {
-					return
-				}
-
-				hasGo := false
-				for _, fi := range fis {
-					name := fi.Name()
-					if !fi.IsDir() {
-						if strings.HasSuffix(name, ".go") {
-							hasGo = true
-						}
-						continue
-					}
-					if name[0] == '.' ||
-						name[0] == '_' ||
-						name == "testdata" ||
-						name == "node_modules" ||
-						(dir == "" && (name == "builtin" || name == "mod")) {
-						continue
-					}
-					scanDir(root, filepath.Join(dir, name))
-				}
-
-				if hasGo && dir != "" {
-					packages = append(packages, dir)
-				}
-			}
-
-			scanRoot := func(dir string) {
-				scanDir(filepath.Join(dir, "src"), "")
-			}
-			scanRoot(build.Default.GOROOT)
-			for _, gopath := range filepath.SplitList(build.Default.GOPATH) {
-				scanRoot(gopath)
-			}
-
-			resp = packages
-
-		case protocol.ActionFetch:
-			context := &build.Context{
-				GOROOT:      build.Default.GOROOT,
-				GOPATH:      build.Default.GOPATH,
-				GOARCH:      req.GOARCH,
-				GOOS:        req.GOOS,
-				BuildTags:   req.BuildTags,
-				ReleaseTags: req.ReleaseTags,
-				Compiler:    "gc",
-			}
-
-			srcs := make(protocol.Srcs)
-			if err := scanPackage(context, req.SrcID, req.Cached, srcs); err != nil {
-				resp = &protocol.FetchResponse{Error: err.Error()}
-				break
-			}
-			resp = &protocol.FetchResponse{Srcs: srcs}
-
-		default:
-			return fmt.Errorf("protocol error")
 		}
+		fmt.Printf("Connection lost.\n\n")
 
-		if err := enc.Encode(resp); err != nil {
-			return err
-		}
-		bw.Flush()
+		time.Sleep(2 * time.Second)
 	}
 }
 
@@ -225,4 +226,18 @@ func calculateHash(files map[string]string) []byte {
 		h.Write([]byte(files[name]))
 	}
 	return h.Sum(nil)
+}
+
+func gobHandler(fn func(r *http.Request) (interface{}, error)) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		result, err := fn(r)
+		if err != nil {
+			log.Println(err)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if err = gob.NewEncoder(w).Encode(result); err != nil {
+			panic(err)
+		}
+	})
 }

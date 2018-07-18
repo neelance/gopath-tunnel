@@ -1,17 +1,10 @@
 package protocol
 
-type Action int
+type ErrorRequest struct {
+	Error string `json:"error"`
+}
 
-const (
-	ActionVersion = iota
-	ActionError
-	ActionList
-	ActionFetch
-)
-
-type Request struct {
-	Action      Action
-	Error       string
+type FetchRequest struct {
 	SrcID       SrcID
 	Cached      map[SrcID][]byte
 	GOARCH      string
