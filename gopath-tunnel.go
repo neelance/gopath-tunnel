@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/md5"
 	"encoding/gob"
 	"fmt"
@@ -15,6 +16,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/donovanhide/eventsource"
+	"github.com/fsnotify/fsnotify"
 	"github.com/neelance/gopath-tunnel/protocol"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/websocket"
@@ -96,7 +99,7 @@ func main() {
 			return nil, err
 		}
 
-		context := &build.Context{
+		buildContext := &build.Context{
 			GOROOT:      build.Default.GOROOT,
 			GOPATH:      build.Default.GOPATH,
 			GOARCH:      req.GOARCH,
@@ -107,11 +110,48 @@ func main() {
 		}
 
 		srcs := make(protocol.Srcs)
-		if err := scanPackage(context, req.SrcID, req.Cached, srcs); err != nil {
+		if err := scanPackage(buildContext, req.SrcID, req.Cached, srcs); err != nil {
 			return &protocol.FetchResponse{Error: err.Error()}, nil
 		}
 		return &protocol.FetchResponse{Srcs: srcs}, nil
 	}))
+
+	mux.HandleFunc("/watch", func(w http.ResponseWriter, r *http.Request) {
+		var req protocol.FetchRequest
+		if err := gob.NewDecoder(r.Body).Decode(&req); err != nil {
+			panic(err)
+		}
+
+		buildContext := &build.Context{
+			GOROOT:      build.Default.GOROOT,
+			GOPATH:      build.Default.GOPATH,
+			GOARCH:      req.GOARCH,
+			GOOS:        req.GOOS,
+			BuildTags:   req.BuildTags,
+			ReleaseTags: req.ReleaseTags,
+			Compiler:    "gc",
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+
+		enc := eventsource.NewEncoder(w, false)
+
+		for {
+			if err := waitForChange(r.Context(), buildContext, req.SrcID); err != nil {
+				if err == context.Canceled {
+					return
+				}
+				panic(err)
+			}
+
+			if err := enc.Encode(protocol.ChangedEvent{}); err != nil {
+				panic(err)
+			}
+			w.(http.Flusher).Flush()
+		}
+	})
 
 	for {
 		fmt.Printf("Connecting to %s...\n", url)
@@ -137,7 +177,94 @@ func main() {
 }
 
 func scanPackage(context *build.Context, srcID protocol.SrcID, cached map[protocol.SrcID][]byte, srcs protocol.Srcs) error {
-	if _, ok := srcs[srcID]; ok {
+	dependencies := make(map[protocol.SrcID]*build.Package)
+	if err := collectDependencies(context, srcID, dependencies); err != nil {
+		return err
+	}
+
+	for _, pkg := range dependencies {
+		files := make(map[string]string)
+		addFiles := func(names []string) {
+			for _, name := range names {
+				contents, err := ioutil.ReadFile(filepath.Join(pkg.Dir, name))
+				if err != nil {
+					log.Fatal(err)
+				}
+				files[filepath.ToSlash(name)] = string(contents)
+			}
+		}
+		addFiles(pkg.GoFiles)
+		addFiles(pkg.CgoFiles)
+		addFiles(pkg.CFiles)
+		addFiles(pkg.CXXFiles)
+		addFiles(pkg.MFiles)
+		addFiles(pkg.HFiles)
+		addFiles(pkg.FFiles)
+		addFiles(pkg.SFiles)
+		addFiles(pkg.SwigFiles)
+		addFiles(pkg.SwigCXXFiles)
+		addFiles(pkg.SysoFiles)
+		if srcID.IncludeTests {
+			addFiles(pkg.TestGoFiles)
+			addFiles(pkg.XTestGoFiles)
+		}
+		filepath.Walk(filepath.Join(pkg.Dir, "testdata"), func(path string, info os.FileInfo, err error) error {
+			if err == nil && !info.IsDir() {
+				addFiles([]string{path[len(pkg.Dir)+1:]})
+			}
+			return nil
+		})
+
+		src := &protocol.Src{
+			Hash: calculateHash(files),
+		}
+		if !bytes.Equal(src.Hash, cached[srcID]) { // only add files if not in cache
+			src.Files = files
+			fmt.Printf("Uploading: %s\n", srcID.ImportPath)
+		}
+		srcs[srcID] = src
+	}
+
+	return nil
+}
+
+func waitForChange(ctx context.Context, buildContext *build.Context, srcID protocol.SrcID) error {
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		return err
+	}
+	defer watcher.Close()
+
+	dependencies := make(map[protocol.SrcID]*build.Package)
+	if err := collectDependencies(buildContext, protocol.SrcID{ImportPath: "github.com/gorilla/mux"}, dependencies); err != nil {
+		return err
+	}
+
+	for _, pkg := range dependencies {
+		if err := watcher.Add(pkg.Dir); err != nil {
+			return err
+		}
+	}
+
+	var debounceTimeout <-chan time.Time
+	for {
+		select {
+		case e := <-watcher.Events:
+			if e.Op != fsnotify.Chmod {
+				debounceTimeout = time.After(100 * time.Millisecond)
+			}
+		case <-debounceTimeout:
+			return nil
+		case err := <-watcher.Errors:
+			return err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+func collectDependencies(context *build.Context, srcID protocol.SrcID, dependencies map[protocol.SrcID]*build.Package) error {
+	if _, ok := dependencies[srcID]; ok {
 		return nil
 	}
 
@@ -150,46 +277,7 @@ func scanPackage(context *build.Context, srcID protocol.SrcID, cached map[protoc
 		return nil
 	}
 
-	files := make(map[string]string)
-	addFiles := func(names []string) {
-		for _, name := range names {
-			contents, err := ioutil.ReadFile(filepath.Join(pkg.Dir, name))
-			if err != nil {
-				log.Fatal(err)
-			}
-			files[filepath.ToSlash(name)] = string(contents)
-		}
-	}
-	addFiles(pkg.GoFiles)
-	addFiles(pkg.CgoFiles)
-	addFiles(pkg.CFiles)
-	addFiles(pkg.CXXFiles)
-	addFiles(pkg.MFiles)
-	addFiles(pkg.HFiles)
-	addFiles(pkg.FFiles)
-	addFiles(pkg.SFiles)
-	addFiles(pkg.SwigFiles)
-	addFiles(pkg.SwigCXXFiles)
-	addFiles(pkg.SysoFiles)
-	if srcID.IncludeTests {
-		addFiles(pkg.TestGoFiles)
-		addFiles(pkg.XTestGoFiles)
-	}
-	filepath.Walk(filepath.Join(pkg.Dir, "testdata"), func(path string, info os.FileInfo, err error) error {
-		if err == nil && !info.IsDir() {
-			addFiles([]string{path[len(pkg.Dir)+1:]})
-		}
-		return nil
-	})
-
-	src := &protocol.Src{
-		Hash: calculateHash(files),
-	}
-	if !bytes.Equal(src.Hash, cached[srcID]) { // only add files if not in cache
-		src.Files = files
-		fmt.Printf("Uploading: %s\n", srcID.ImportPath)
-	}
-	srcs[srcID] = src
+	dependencies[srcID] = pkg
 
 	imports := pkg.Imports
 	if srcID.IncludeTests {
@@ -206,7 +294,7 @@ func scanPackage(context *build.Context, srcID protocol.SrcID, cached map[protoc
 			return err
 		}
 
-		if err := scanPackage(context, protocol.SrcID{ImportPath: impPkg.ImportPath, IncludeTests: false}, cached, srcs); err != nil {
+		if err := collectDependencies(context, protocol.SrcID{ImportPath: impPkg.ImportPath, IncludeTests: false}, dependencies); err != nil {
 			return err
 		}
 	}

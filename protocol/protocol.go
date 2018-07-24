@@ -29,3 +29,9 @@ type Src struct {
 }
 
 type Srcs map[SrcID]*Src
+
+type ChangedEvent struct{}
+
+func (t ChangedEvent) Data() string  { return "changed" }
+func (t ChangedEvent) Event() string { return "" }
+func (t ChangedEvent) Id() string    { return "" }
