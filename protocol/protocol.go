@@ -5,17 +5,14 @@ type ErrorRequest struct {
 }
 
 type FetchRequest struct {
-	SrcID       SrcID
-	Cached      map[SrcID][]byte
-	GOARCH      string
-	GOOS        string
-	BuildTags   []string
-	ReleaseTags []string
+	SrcID  SrcID
+	Cached []FileID
 }
 
 type FetchResponse struct {
-	Srcs  Srcs
-	Error string
+	Files    map[string]FileID
+	Contents map[FileID][]byte
+	Error    string
 }
 
 type SrcID struct {
@@ -23,12 +20,7 @@ type SrcID struct {
 	IncludeTests bool
 }
 
-type Src struct {
-	Files map[string]string
-	Hash  []byte
-}
-
-type Srcs map[SrcID]*Src
+type FileID string
 
 type ChangedEvent struct{}
 

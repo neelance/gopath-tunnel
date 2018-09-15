@@ -1,18 +1,16 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/md5"
 	"encoding/gob"
 	"fmt"
-	"go/build"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
-	"sort"
+	"runtime"
 	"strings"
 	"time"
 
@@ -21,14 +19,16 @@ import (
 	"github.com/neelance/gopath-tunnel/protocol"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/websocket"
+	"golang.org/x/tools/go/packages"
 )
 
 func main() {
-	if len(os.Args) != 2 {
-		fmt.Println("Usage: gopath-tunnel [url]")
+	if len(os.Args) < 3 {
+		fmt.Println("Usage: gopath-tunnel [url] [packages]")
 		os.Exit(1)
 	}
 	url := os.Args[1]
+	patterns := os.Args[2:]
 
 	gotError := false
 	mux := http.NewServeMux()
@@ -50,47 +50,18 @@ func main() {
 	}))
 
 	mux.Handle("/packages", gobHandler(func(r *http.Request) (interface{}, error) {
-		packages := []string{}
-		var scanDir func(root string, dir string)
-		scanDir = func(root string, dir string) {
-			fis, err := ioutil.ReadDir(filepath.Join(root, dir))
-			if err != nil {
-				return
-			}
-
-			hasGo := false
-			for _, fi := range fis {
-				name := fi.Name()
-				if !fi.IsDir() {
-					if strings.HasSuffix(name, ".go") {
-						hasGo = true
-					}
-					continue
-				}
-				if name[0] == '.' ||
-					name[0] == '_' ||
-					name == "testdata" ||
-					name == "node_modules" ||
-					(dir == "" && (name == "builtin" || name == "mod")) {
-					continue
-				}
-				scanDir(root, filepath.Join(dir, name))
-			}
-
-			if hasGo && dir != "" {
-				packages = append(packages, dir)
-			}
+		pkgs, err := packages.Load(&packages.Config{
+			Mode: packages.LoadFiles,
+		}, patterns...)
+		if err != nil {
+			return nil, err
 		}
 
-		scanRoot := func(dir string) {
-			scanDir(filepath.Join(dir, "src"), "")
+		paths := []string{}
+		for _, pkg := range pkgs {
+			paths = append(paths, pkg.PkgPath)
 		}
-		scanRoot(build.Default.GOROOT)
-		for _, gopath := range filepath.SplitList(build.Default.GOPATH) {
-			scanRoot(gopath)
-		}
-
-		return packages, nil
+		return paths, nil
 	}))
 
 	mux.Handle("/fetch", gobHandler(func(r *http.Request) (interface{}, error) {
@@ -99,37 +70,20 @@ func main() {
 			return nil, err
 		}
 
-		buildContext := &build.Context{
-			GOROOT:      build.Default.GOROOT,
-			GOPATH:      build.Default.GOPATH,
-			GOARCH:      req.GOARCH,
-			GOOS:        req.GOOS,
-			BuildTags:   req.BuildTags,
-			ReleaseTags: req.ReleaseTags,
-			Compiler:    "gc",
+		resp := &protocol.FetchResponse{
+			Files:    make(map[string]protocol.FileID),
+			Contents: make(map[protocol.FileID][]byte),
 		}
-
-		srcs := make(protocol.Srcs)
-		if err := scanPackage(buildContext, req.SrcID, req.Cached, srcs); err != nil {
+		if err := scanPackage(req.SrcID, req.Cached, resp); err != nil {
 			return &protocol.FetchResponse{Error: err.Error()}, nil
 		}
-		return &protocol.FetchResponse{Srcs: srcs}, nil
+		return resp, nil
 	}))
 
 	mux.HandleFunc("/watch", func(w http.ResponseWriter, r *http.Request) {
 		var req protocol.FetchRequest
 		if err := gob.NewDecoder(r.Body).Decode(&req); err != nil {
 			panic(err)
-		}
-
-		buildContext := &build.Context{
-			GOROOT:      build.Default.GOROOT,
-			GOPATH:      build.Default.GOPATH,
-			GOARCH:      req.GOARCH,
-			GOOS:        req.GOOS,
-			BuildTags:   req.BuildTags,
-			ReleaseTags: req.ReleaseTags,
-			Compiler:    "gc",
 		}
 
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -139,7 +93,7 @@ func main() {
 		enc := eventsource.NewEncoder(w, false)
 
 		for {
-			if err := waitForChange(r.Context(), buildContext, req.SrcID); err != nil {
+			if err := waitForChange(r.Context(), req.SrcID); err != nil {
 				if err == context.Canceled {
 					return
 				}
@@ -176,73 +130,59 @@ func main() {
 	}
 }
 
-func scanPackage(context *build.Context, srcID protocol.SrcID, cached map[protocol.SrcID][]byte, srcs protocol.Srcs) error {
-	dependencies := make(map[protocol.SrcID]*build.Package)
-	if err := collectDependencies(context, srcID, dependencies); err != nil {
-		return err
+func scanPackage(srcID protocol.SrcID, cached []protocol.FileID, resp *protocol.FetchResponse) error {
+	cachedMap := make(map[protocol.FileID]struct{})
+	for _, id := range cached {
+		cachedMap[id] = struct{}{}
 	}
 
-	for _, pkg := range dependencies {
-		files := make(map[string]string)
-		addFiles := func(names []string) {
-			for _, name := range names {
-				contents, err := ioutil.ReadFile(filepath.Join(pkg.Dir, name))
-				if err != nil {
-					log.Fatal(err)
-				}
-				files[filepath.ToSlash(name)] = string(contents)
-			}
+	addFile := func(dst, src string) {
+		if _, ok := resp.Files[dst]; ok {
+			return
 		}
-		addFiles(pkg.GoFiles)
-		addFiles(pkg.CgoFiles)
-		addFiles(pkg.CFiles)
-		addFiles(pkg.CXXFiles)
-		addFiles(pkg.MFiles)
-		addFiles(pkg.HFiles)
-		addFiles(pkg.FFiles)
-		addFiles(pkg.SFiles)
-		addFiles(pkg.SwigFiles)
-		addFiles(pkg.SwigCXXFiles)
-		addFiles(pkg.SysoFiles)
-		if srcID.IncludeTests {
-			addFiles(pkg.TestGoFiles)
-			addFiles(pkg.XTestGoFiles)
-		}
-		filepath.Walk(filepath.Join(pkg.Dir, "testdata"), func(path string, info os.FileInfo, err error) error {
-			if err == nil && !info.IsDir() {
-				addFiles([]string{path[len(pkg.Dir)+1:]})
-			}
-			return nil
-		})
 
-		src := &protocol.Src{
-			Hash: calculateHash(files),
+		contents, err := ioutil.ReadFile(src)
+		if err != nil {
+			log.Fatal(err)
 		}
-		if !bytes.Equal(src.Hash, cached[srcID]) { // only add files if not in cache
-			src.Files = files
-			fmt.Printf("Uploading: %s\n", srcID.ImportPath)
+
+		h := md5.New()
+		h.Write(contents)
+		id := protocol.FileID(h.Sum(nil))
+
+		resp.Files[dst] = id
+		if _, ok := cachedMap[id]; !ok {
+			resp.Contents[id] = contents
 		}
-		srcs[srcID] = src
+	}
+
+	deps, err := collectDependencies(srcID)
+	if err != nil {
+		return err
+	}
+	for _, pkg := range deps {
+		for _, src := range pkg.GoFiles {
+			addFile(pkg.PkgPath+"/"+filepath.Base(src), src)
+		}
 	}
 
 	return nil
 }
 
-func waitForChange(ctx context.Context, buildContext *build.Context, srcID protocol.SrcID) error {
+func waitForChange(ctx context.Context, srcID protocol.SrcID) error {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		return err
 	}
 	defer watcher.Close()
 
-	dependencies := make(map[protocol.SrcID]*build.Package)
-	if err := collectDependencies(buildContext, protocol.SrcID{ImportPath: "github.com/gorilla/mux"}, dependencies); err != nil {
+	deps, err := collectDependencies(srcID)
+	if err != nil {
 		return err
 	}
-
-	for _, pkg := range dependencies {
-		if err := watcher.Add(pkg.Dir); err != nil {
-			return err
+	for _, pkg := range deps {
+		if err := watcher.Add(filepath.Dir(pkg.GoFiles[0])); err != nil {
+			panic(err)
 		}
 	}
 
@@ -263,57 +203,43 @@ func waitForChange(ctx context.Context, buildContext *build.Context, srcID proto
 	}
 }
 
-func collectDependencies(context *build.Context, srcID protocol.SrcID, dependencies map[protocol.SrcID]*build.Package) error {
-	if _, ok := dependencies[srcID]; ok {
-		return nil
+func collectDependencies(srcID protocol.SrcID) ([]*packages.Package, error) {
+	var depedencies []*packages.Package
+	seen := make(map[*packages.Package]struct{})
+	var visit func(*packages.Package)
+	visit = func(pkg *packages.Package) {
+		if _, ok := seen[pkg]; ok {
+			return
+		}
+		seen[pkg] = struct{}{}
+
+		if pkg.PkgPath == "unsafe" || strings.HasSuffix(pkg.PkgPath, ".test") {
+			return
+		}
+		if strings.HasPrefix(pkg.GoFiles[0], runtime.GOROOT()) {
+			return
+		}
+
+		depedencies = append(depedencies, pkg)
+
+		for _, imp := range pkg.Imports {
+			visit(imp)
+		}
 	}
 
-	pkg, err := context.Import(srcID.ImportPath, "", 0)
+	pkgs, err := packages.Load(&packages.Config{
+		Mode:  packages.LoadImports,
+		Tests: srcID.IncludeTests,
+	}, srcID.ImportPath)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	if pkg.Goroot {
-		return nil
+	for _, pkg := range pkgs {
+		visit(pkg)
 	}
 
-	dependencies[srcID] = pkg
-
-	imports := pkg.Imports
-	if srcID.IncludeTests {
-		imports = append(imports, pkg.TestImports...)
-		imports = append(imports, pkg.XTestImports...)
-	}
-	for _, imp := range imports {
-		if imp == "C" || imp == srcID.ImportPath {
-			continue
-		}
-
-		impPkg, err := context.Import(imp, pkg.Dir, build.FindOnly)
-		if err != nil {
-			return err
-		}
-
-		if err := collectDependencies(context, protocol.SrcID{ImportPath: impPkg.ImportPath, IncludeTests: false}, dependencies); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func calculateHash(files map[string]string) []byte {
-	h := md5.New()
-	var names []string
-	for name := range files {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	for _, name := range names {
-		h.Write([]byte(name))
-		h.Write([]byte(files[name]))
-	}
-	return h.Sum(nil)
+	return depedencies, nil
 }
 
 func gobHandler(fn func(r *http.Request) (interface{}, error)) http.Handler {

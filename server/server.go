@@ -6,7 +6,6 @@ import (
 	"crypto/tls"
 	"encoding/gob"
 	"errors"
-	"go/build"
 	"log"
 	"net"
 	"net/http"
@@ -14,13 +13,15 @@ import (
 
 	"golang.org/x/net/http2"
 	"golang.org/x/net/websocket"
+	"golang.org/x/tools/godoc/vfs"
+	"golang.org/x/tools/godoc/vfs/mapfs"
 
 	"github.com/donovanhide/eventsource"
 	"github.com/neelance/gopath-tunnel/protocol"
 )
 
 type Server struct {
-	cache protocol.Srcs
+	cache map[protocol.FileID][]byte
 
 	mu sync.Mutex
 	cl *http.Client
@@ -35,7 +36,7 @@ func (s *Server) Client() *http.Client {
 
 func New() *Server {
 	return &Server{
-		cache: make(protocol.Srcs),
+		cache: make(map[protocol.FileID][]byte),
 	}
 }
 
@@ -94,10 +95,10 @@ func (s *Server) List(ctx context.Context) ([]string, error) {
 	return pkgs, nil
 }
 
-func (s *Server) Fetch(ctx context.Context, importPath string, includeTests bool) (protocol.Srcs, error) {
-	cached := make(map[protocol.SrcID][]byte)
-	for id, src := range s.cache {
-		cached[id] = src.Hash
+func (s *Server) Fetch(ctx context.Context, importPath string, includeTests bool) (vfs.FileSystem, error) {
+	var cached []protocol.FileID
+	for id := range s.cache {
+		cached = append(cached, id)
 	}
 
 	req := &protocol.FetchRequest{
@@ -105,29 +106,26 @@ func (s *Server) Fetch(ctx context.Context, importPath string, includeTests bool
 			ImportPath:   importPath,
 			IncludeTests: includeTests,
 		},
-		Cached:      cached,
-		GOARCH:      build.Default.GOARCH,
-		GOOS:        build.Default.GOOS,
-		ReleaseTags: build.Default.ReleaseTags,
+		Cached: cached,
 	}
 	var resp protocol.FetchResponse
 	if err := post(s.Client(), "/fetch", req, &resp); err != nil {
 		return nil, err
 	}
 
-	for id, src := range resp.Srcs {
-		if src.Files == nil {
-			cachedSrc, ok := s.cache[id]
-			if !ok || !bytes.Equal(cachedSrc.Hash, src.Hash) {
-				return nil, errors.New("cache error")
-			}
-			src.Files = cachedSrc.Files
-			continue
-		}
-		s.cache[id] = src
+	if resp.Error != "" {
+		return nil, errors.New(resp.Error)
 	}
 
-	return resp.Srcs, nil
+	for id, contents := range resp.Contents {
+		s.cache[id] = contents
+	}
+
+	files := make(map[string]string)
+	for name, id := range resp.Files {
+		files[name] = string(s.cache[id])
+	}
+	return mapfs.New(files), nil
 }
 
 func (s *Server) Watch(ctx context.Context, importPath string, includeTests bool) (<-chan struct{}, error) {
@@ -136,9 +134,6 @@ func (s *Server) Watch(ctx context.Context, importPath string, includeTests bool
 			ImportPath:   importPath,
 			IncludeTests: includeTests,
 		},
-		GOARCH:      build.Default.GOARCH,
-		GOOS:        build.Default.GOOS,
-		ReleaseTags: build.Default.ReleaseTags,
 	}
 
 	var buf bytes.Buffer
