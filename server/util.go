@@ -47,7 +47,7 @@ func SyncFileSystemToDisk(fs vfs.FileSystem, rootDir string) error {
 		fullName := filepath.Join(rootDir, fi.Name())
 		if fi.IsDir() {
 			if _, err := fs.ReadDir(fi.Name()); os.IsNotExist(err) {
-				return os.RemoveAll(fullName)
+				return os.Remove(fullName)
 			}
 			return nil
 		}
@@ -70,13 +70,13 @@ func walk(fs vfs.FileSystem, dir string, visitor func(fi os.FileInfo) error) err
 
 	for _, fi := range fis {
 		fullName := path.Join(dir, fi.Name())
-		if err := visitor(&walkFileInfo{fi, fullName}); err != nil {
-			return err
-		}
 		if fi.IsDir() {
 			if err := walk(fs, fullName, visitor); err != nil {
 				return err
 			}
+		}
+		if err := visitor(&walkFileInfo{fi, fullName}); err != nil {
+			return err
 		}
 	}
 
