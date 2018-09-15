@@ -216,7 +216,7 @@ func collectDependencies(srcID protocol.SrcID) ([]*packages.Package, error) {
 		if pkg.PkgPath == "unsafe" || strings.HasSuffix(pkg.PkgPath, ".test") {
 			return
 		}
-		if strings.HasPrefix(pkg.GoFiles[0], runtime.GOROOT()) {
+		if strings.HasPrefix(pkg.GoFiles[0], filepath.Join(runtime.GOROOT(), "src")) {
 			return
 		}
 
