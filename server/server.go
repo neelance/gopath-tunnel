@@ -34,6 +34,12 @@ func (s *Server) Client() *http.Client {
 	return cl
 }
 
+func (s *Server) SetClient(cl *http.Client) {
+	s.mu.Lock()
+	s.cl = cl
+	s.mu.Unlock()
+}
+
 func New() *Server {
 	return &Server{
 		cache: make(map[protocol.FileID][]byte),
