@@ -41,7 +41,8 @@ func NewHandler(patterns []string, gotError *bool) http.Handler {
 
 	mux.Handle("/packages", gobHandler(func(r *http.Request) (interface{}, error) {
 		pkgs, err := packages.Load(&packages.Config{
-			Mode: packages.LoadFiles,
+			Mode:    packages.LoadFiles,
+			Context: r.Context(),
 		}, patterns...)
 		if err != nil {
 			return nil, err
@@ -64,7 +65,7 @@ func NewHandler(patterns []string, gotError *bool) http.Handler {
 			Files:    make(map[string]protocol.FileID),
 			Contents: make(map[protocol.FileID][]byte),
 		}
-		if err := scanPackage(req.SrcID, req.Cached, resp); err != nil {
+		if err := scanPackage(r.Context(), req.SrcID, req.Cached, resp); err != nil {
 			return &protocol.FetchResponse{Error: err.Error()}, nil
 		}
 		return resp, nil
@@ -100,7 +101,7 @@ func NewHandler(patterns []string, gotError *bool) http.Handler {
 	return mux
 }
 
-func scanPackage(srcID protocol.SrcID, cached []protocol.FileID, resp *protocol.FetchResponse) error {
+func scanPackage(ctx context.Context, srcID protocol.SrcID, cached []protocol.FileID, resp *protocol.FetchResponse) error {
 	cachedMap := make(map[protocol.FileID]struct{})
 	for _, id := range cached {
 		cachedMap[id] = struct{}{}
@@ -126,7 +127,7 @@ func scanPackage(srcID protocol.SrcID, cached []protocol.FileID, resp *protocol.
 		}
 	}
 
-	deps, err := collectDependencies(srcID)
+	deps, err := collectDependencies(ctx, srcID)
 	if err != nil {
 		return err
 	}
@@ -146,7 +147,7 @@ func waitForChange(ctx context.Context, srcID protocol.SrcID) error {
 	}
 	defer watcher.Close()
 
-	deps, err := collectDependencies(srcID)
+	deps, err := collectDependencies(ctx, srcID)
 	if err != nil {
 		return err
 	}
@@ -173,7 +174,7 @@ func waitForChange(ctx context.Context, srcID protocol.SrcID) error {
 	}
 }
 
-func collectDependencies(srcID protocol.SrcID) ([]*packages.Package, error) {
+func collectDependencies(ctx context.Context, srcID protocol.SrcID) ([]*packages.Package, error) {
 	var depedencies []*packages.Package
 	seen := make(map[*packages.Package]struct{})
 	var visit func(*packages.Package)
@@ -198,8 +199,9 @@ func collectDependencies(srcID protocol.SrcID) ([]*packages.Package, error) {
 	}
 
 	pkgs, err := packages.Load(&packages.Config{
-		Mode:  packages.LoadImports,
-		Tests: srcID.IncludeTests,
+		Mode:    packages.LoadImports,
+		Tests:   srcID.IncludeTests,
+		Context: ctx,
 	}, srcID.ImportPath)
 	if err != nil {
 		return nil, err
