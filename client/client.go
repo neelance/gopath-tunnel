@@ -131,7 +131,7 @@ func scanPackage(srcID protocol.SrcID, cached []protocol.FileID, resp *protocol.
 		return err
 	}
 	for _, pkg := range deps {
-		for _, src := range pkg.GoFiles {
+		for _, src := range append(pkg.GoFiles, pkg.OtherFiles...) {
 			addFile(pkg.PkgPath+"/"+filepath.Base(src), src)
 		}
 	}
