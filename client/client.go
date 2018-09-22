@@ -175,29 +175,6 @@ func waitForChange(ctx context.Context, srcID protocol.SrcID) error {
 }
 
 func collectDependencies(ctx context.Context, srcID protocol.SrcID) ([]*packages.Package, error) {
-	var depedencies []*packages.Package
-	seen := make(map[*packages.Package]struct{})
-	var visit func(*packages.Package)
-	visit = func(pkg *packages.Package) {
-		if _, ok := seen[pkg]; ok {
-			return
-		}
-		seen[pkg] = struct{}{}
-
-		if pkg.PkgPath == "unsafe" || strings.HasSuffix(pkg.PkgPath, ".test") {
-			return
-		}
-		if strings.HasPrefix(pkg.GoFiles[0], filepath.Join(runtime.GOROOT(), "src")) {
-			return
-		}
-
-		depedencies = append(depedencies, pkg)
-
-		for _, imp := range pkg.Imports {
-			visit(imp)
-		}
-	}
-
 	pkgs, err := packages.Load(&packages.Config{
 		Mode:    packages.LoadImports,
 		Tests:   srcID.IncludeTests,
@@ -207,9 +184,18 @@ func collectDependencies(ctx context.Context, srcID protocol.SrcID) ([]*packages
 		return nil, err
 	}
 
-	for _, pkg := range pkgs {
-		visit(pkg)
-	}
+	var depedencies []*packages.Package
+	packages.Visit(pkgs, func(pkg *packages.Package) bool {
+		if pkg.PkgPath == "unsafe" || strings.HasSuffix(pkg.PkgPath, ".test") {
+			return false
+		}
+		if strings.HasPrefix(pkg.GoFiles[0], filepath.Join(runtime.GOROOT(), "src")) {
+			return false
+		}
+
+		depedencies = append(depedencies, pkg)
+		return true
+	}, nil)
 
 	return depedencies, nil
 }
